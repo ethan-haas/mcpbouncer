@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Tests (pinned totals, zero skips)
+        run: |
+          python -m pytest tests/ -q --junitxml=results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          s = ET.parse("results.xml").getroot()
+          s = s.find("testsuite") if s.tag == "testsuites" else s
+          got = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(got)
+          # Pinned, and skipped must be 0. Two path-confinement tests create
+          # symlinks and skip on Windows; on Linux they MUST run, because a
+          # symlink out of the declared root is exactly what rule 3 exists to
+          # catch. An unpinned suite would go green having skipped them.
+          assert got == {"tests": 163, "failures": 0, "errors": 0, "skipped": 0}, got
+          print("pinned totals match, no skips")
+          PY
+
+      - name: Allowed traffic passes, denials deny (exit codes)
+        run: |
+          # mcpbouncer exits non-zero BY DESIGN when anything is denied, so every
+          # invocation captures $? explicitly. The previous workflow ran
+          # `check ... ; test $? -eq 1` under Actions' `bash -e`, which aborted
+          # the step on that non-zero exit before `test` ever ran.
+          set +e
+          python -m mcpbouncer check examples/policy.toml examples/calls-allowed.jsonl \
+            --audit-log /tmp/allowed.audit.jsonl >/dev/null 2>&1
+          test $? = 0 || { echo "allowed workload must exit 0"; exit 1; }
+          python -m mcpbouncer check examples/policy.toml examples/calls-traversal.jsonl \
+            --audit-log /tmp/trav.audit.jsonl >/dev/null 2>&1
+          test $? = 1 || { echo "traversal must exit 1"; exit 1; }
+          python -m mcpbouncer check examples/policy.toml ./no_such_file.jsonl >/dev/null 2>&1
+          test $? = 2 || { echo "missing input must exit 2"; exit 1; }
+          set -e
+          echo "exit-code contract holds (0 / 1 / 2 all asserted)"
+
+      - name: Unmatched is DENIED — the whole premise
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, tempfile, os
+          probes = [
+              ("undeclared tool",     {"id":"a","server":"files","tool":"delete_everything","arguments":{}}),
+              ("undeclared server",   {"id":"b","server":"nope","tool":"read_file","arguments":{"path":"/srv/app/x"}}),
+              ("undeclared argument", {"id":"c","server":"files","tool":"read_file",
+                                       "arguments":{"path":"/srv/app/x","extra":"1"}}),
+          ]
+          d = tempfile.mkdtemp(); p = os.path.join(d, "calls.jsonl")
+          with open(p, "w") as f:
+              for _, c in probes:
+                  f.write(json.dumps(c) + "\n")
+          out = subprocess.run([sys.executable, "-m", "mcpbouncer", "check",
+                                "examples/policy.toml", p,
+                                "--audit-log", os.path.join(d, "a.jsonl")],
+                               capture_output=True, text=True).stdout
+          decisions = [json.loads(l) for l in out.splitlines() if l.strip()]
+          verdicts = [x["decision"] for x in decisions if not x.get("summary")]
+          assert verdicts == ["unmatched-deny"] * 3, (verdicts, out)
+          print("unmatched tool / server / argument all denied, never forwarded")
+          PY
+
+      - name: Path confinement, including the separator-less prefix
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, tempfile, os
+          # /srv/appdata must NOT be treated as inside root /srv/app. A prefix
+          # check without a separator lets this through; that is the class this
+          # rule is written against.
+          cases = [("/srv/app/ok.txt", "allow"),
+                   ("/srv/appdata/secrets.txt", "deny"),
+                   ("/srv/app/../../etc/passwd", "deny"),
+                   ("/etc/shadow", "deny")]
+          d = tempfile.mkdtemp(); p = os.path.join(d, "c.jsonl")
+          with open(p, "w") as f:
+              for i, (path, _) in enumerate(cases):
+                  f.write(json.dumps({"id": f"p{i}", "server": "files",
+                                      "tool": "read_file", "arguments": {"path": path}}) + "\n")
+          out = subprocess.run([sys.executable, "-m", "mcpbouncer", "check",
+                                "examples/policy.toml", p,
+                                "--audit-log", os.path.join(d, "a.jsonl")],
+                               capture_output=True, text=True).stdout
+          got = [x["decision"] for x in (json.loads(l) for l in out.splitlines() if l.strip())
+                 if not x.get("summary")]
+          assert got == [w for _, w in cases], (got, out)
+          print("path confinement holds, separator-less prefix denied")
+          PY
+
+      - name: Every decision is audited, and points at its evidence
+        run: |
+          python - <<'PY'
+          import json
+          rows = [json.loads(l) for l in open("/tmp/trav.audit.jsonl") if l.strip()]
+          assert rows, "audit log must not be empty"
+          for r in rows:
+              assert r.get("decision"), r
+              assert r.get("json_pointer"), r   # a denial must point at what caused it
+          print(f"audit log complete: {len(rows)} decision(s), all with a json_pointer")
+          PY
+
+      - name: Determinism across processes
+        run: |
+          python - <<'PY'
+          import hashlib, os, subprocess, sys
+          digests = set()
+          for seed in ("0", "1", "42", "1337"):
+              env = dict(os.environ, PYTHONHASHSEED=seed)
+              # NOTE: the same audit path every time. The summary line echoes
+              # `audit_log`, so varying it per seed would change stdout for a
+              # reason that has nothing to do with hash ordering.
+              out = subprocess.run([sys.executable, "-m", "mcpbouncer", "check",
+                                    "examples/policy.toml", "examples/calls-traversal.jsonl",
+                                    "--audit-log", "/tmp/determinism.jsonl"],
+                                   capture_output=True, env=env).stdout
+              digests.add(hashlib.sha256(out).hexdigest())
+          assert len(digests) == 1, f"non-deterministic across hash seeds: {digests}"
+          print("byte-identical across 4 PYTHONHASHSEED values")
+          PY

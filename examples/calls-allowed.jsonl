@@ -1,0 +1,1 @@
+{"id": "ok-1", "server": "files", "tool": "read_file", "arguments": {"path": "/srv/app/readme.txt"}}

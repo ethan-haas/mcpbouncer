@@ -1,0 +1,79 @@
+policy_version = 1
+
+[limits]
+max_string_length = 256
+max_array_length = 20
+max_nesting_depth = 4
+
+[rate_limits]
+"files.write_file" = 3
+"files.read_file" = 1000
+
+[[redaction]]
+id = "aws_access_key"
+pattern = 'AKIA[0-9A-Z]{16}'
+
+[[redaction]]
+id = "generic_secret"
+pattern = '(?i)\b(secret|api[_-]?key|token|password)\b\s*[:=]\s*\S+'
+
+[[server]]
+name = "files"
+enforce_read_only = false
+
+  [[server.tool]]
+  name = "read_file"
+  read_only = true
+
+    [[server.tool.arg]]
+    name = "path"
+    type = "path"
+    root = "/srv/app"
+
+  [[server.tool]]
+  name = "write_file"
+  read_only = false
+
+    [[server.tool.arg]]
+    name = "path"
+    type = "path"
+    root = "/srv/app"
+
+  [[server.tool]]
+  name = "search"
+  read_only = true
+
+    [[server.tool.arg]]
+    name = "query"
+    type = "string"
+    pattern = '^[\w \-\.]{1,200}$'
+
+    [[server.tool.arg]]
+    name = "mode"
+    type = "enum"
+    values = ["fast", "thorough"]
+
+[[server]]
+name = "web"
+enforce_read_only = true
+
+  [[server.tool]]
+  name = "fetch"
+  read_only = true
+
+    [[server.tool.arg]]
+    name = "url"
+    type = "string"
+    pattern = '^https://[a-zA-Z0-9._\-]+(/.*)?$'
+
+[[server]]
+name = "admin"
+enforce_read_only = true
+
+  [[server.tool]]
+  name = "status"
+  read_only = true
+
+  [[server.tool]]
+  name = "purge"
+  read_only = false
